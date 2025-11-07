@@ -63,8 +63,7 @@ class IEMOCAPPreprocessor:
         # Initialize models
         self._init_models()
     
-    from huggingface_hub import login
-    login("YOUR TOKEN")
+    
         
     def _init_models(self):
         """Initialize emotion2vec and Whisper"""
@@ -73,12 +72,12 @@ class IEMOCAPPreprocessor:
         try:
             from funasr import AutoModel
             
-            # 使用 emotion2vec+ large 模型
+            # 使用 emotion2vecbase 模型
             self.emotion_model = AutoModel(
                 model="iic/emotion2vec_base",
-                model_revision="v2.0.0",   # 固定模型版本，不會爆
-                device="cuda"              # 保證推論在 GPU 上跑
-            )
+                hub="ms"  # 明確指定從 ModelScope (ms) 下載
+                )
+            # =================================================
             
             print("✓ emotion2vec 模型載入成功")
             
