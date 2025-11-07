@@ -339,7 +339,7 @@ class IEMOCAPPreprocessor:
         
         return processed_data
     
-    def process_test_sessions(self, sessions=[ 1]):
+    def process_test_sessions(self, sessions=[ 5]):
         """Process part of  sessions"""
         all_data = []
         
@@ -394,7 +394,7 @@ def main():
         output_path=OUTPUT_PATH
     )
     
-    processed_data = preprocessor.process_test_sessions(sessions=[ 1])
+    processed_data = preprocessor.process_test_sessions(sessions=[ 5])
     
     print("\n✓ Preprocessing complete!")
 
