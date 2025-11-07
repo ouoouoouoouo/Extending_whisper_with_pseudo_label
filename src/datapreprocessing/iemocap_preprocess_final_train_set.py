@@ -71,8 +71,8 @@ class IEMOCAPPreprocessor:
             
             # 使用 emotion2vec+ large 模型
             self.emotion_model = AutoModel(
-                model="iic/emotion2vec_plus_large",
-                hub="hf"  # 使用 HuggingFace
+                model="iic/emotion2vec_base",
+                hub="ms"  # 使用 modelscope
             )
             
             print("✓ emotion2vec 模型載入成功")
