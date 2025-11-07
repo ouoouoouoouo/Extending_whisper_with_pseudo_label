@@ -13,6 +13,7 @@ from pathlib import Path
 from tqdm import tqdm
 from collections import Counter
 import re
+from funasr import AutoModel
 
 # 設置 audio backend
 try:
@@ -61,6 +62,9 @@ class IEMOCAPPreprocessor:
         
         # Initialize models
         self._init_models()
+    
+    from huggingface_hub import login
+    login("YOUR TOKEN")
         
     def _init_models(self):
         """Initialize emotion2vec and Whisper"""
@@ -71,8 +75,9 @@ class IEMOCAPPreprocessor:
             
             # 使用 emotion2vec+ large 模型
             self.emotion_model = AutoModel(
-                model="iic/emotion2vec_plus_large",
-                hub="hf"  # 使用 HuggingFace
+                model="iic/emotion2vec_base",
+                model_revision="v2.0.0",   # 固定模型版本，不會爆
+                device="cuda"              # 保證推論在 GPU 上跑
             )
             
             print("✓ emotion2vec 模型載入成功")
@@ -339,7 +344,7 @@ class IEMOCAPPreprocessor:
         
         return processed_data
     
-    def process_test_sessions(self, sessions=[ 5]):
+    def process_test_sessions(self, sessions=[5]):
         """Process part of  sessions"""
         all_data = []
         
@@ -394,7 +399,7 @@ def main():
         output_path=OUTPUT_PATH
     )
     
-    processed_data = preprocessor.process_test_sessions(sessions=[ 5])
+    processed_data = preprocessor.process_test_sessions(sessions=[5])
     
     print("\n✓ Preprocessing complete!")
 
