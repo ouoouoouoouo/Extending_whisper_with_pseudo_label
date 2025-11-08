@@ -1,4 +1,5 @@
 """
+test set:session 1
 IEMOCAP Dataset Preprocessing with emotion2vec
 使用預訓練的 emotion2vec 模型生成 frame-level 情緒標籤
 """
@@ -343,7 +344,7 @@ class IEMOCAPPreprocessor:
         
         return processed_data
     
-    def process_test_sessions(self, sessions=[5]):
+    def process_test_sessions(self, sessions=[1]):
         """Process part of  sessions"""
         all_data = []
         
@@ -398,7 +399,7 @@ def main():
         output_path=OUTPUT_PATH
     )
     
-    processed_data = preprocessor.process_test_sessions(sessions=[5])
+    processed_data = preprocessor.process_test_sessions(sessions=[1])
     
     print("\n✓ Preprocessing complete!")
 
