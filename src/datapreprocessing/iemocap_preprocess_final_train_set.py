@@ -13,6 +13,9 @@ from pathlib import Path
 from tqdm import tqdm
 from collections import Counter
 import re
+from transformers import AutoModel, AutoTokenizer
+
+
 
 # 設置 audio backend
 try:
@@ -61,22 +64,27 @@ class IEMOCAPPreprocessor:
         
         # Initialize models
         self._init_models()
+    
+    from huggingface_hub import login
+    login("your token")
         
     def _init_models(self):
         """Initialize emotion2vec and Whisper"""
         print("正在載入 emotion2vec 模型...")
-        
+
         try:
             from funasr import AutoModel
-            
-            # 使用 emotion2vec+ large 模型
+
+            # === 修正：改回使用 ModelScope 線上 ID，讓它自動下載 ===
+            # 建議使用 'iic/emotion2vec_plus_large' 因為它效果更好且通常包含完整設定
+                        # 如果您堅持用 base 版，也可以寫 'damo/emotion2vec_base'
             self.emotion_model = AutoModel(
                 model="iic/emotion2vec_base",
-                hub="ms"  # 使用 modelscope
-            )
-            
+                hub="ms"  # 明確指定從 ModelScope (ms) 下載
+                )
+            # =================================================
             print("✓ emotion2vec 模型載入成功")
-            
+                
         except Exception as e:
             print(f"警告：無法載入 emotion2vec: {e}")
             print("將使用原始標註作為後備方案")
@@ -339,25 +347,14 @@ class IEMOCAPPreprocessor:
         
         return processed_data
     
-    def process_train_sessions(self, sessions=[ 2, 3, 4]):
-        """Process part of  sessions"""
-        all_data = []
+    def process_session_and_save(self, session_num):
+        session_data = self.process_session(session_num)
+        out_file = self.output_path / f"Session{session_num}.json"
+        with open(out_file, "w") as f:
+            json.dump(session_data, f, indent=2)
+        print(f"✓ Saved Session {session_num} → {out_file}")
+        return session_data
         
-        for session_num in sessions:
-            session_data = self.process_session(session_num)
-            all_data.extend(session_data)
-        
-        output_file = self.output_path / "iemocap_with_pseudo_labels_train_set.json"
-        with open(output_file, 'w') as f:
-            json.dump(all_data, f, indent=2)
-        
-        print(f"\n✓ Processed {len(all_data)} utterances")
-        print(f"✓ Saved to {output_file}")
-        
-        self.print_statistics(all_data)
-        
-        return all_data
-    
     def print_statistics(self, data):
         """Print statistics"""
         print("\n" + "="*60)
@@ -394,10 +391,14 @@ def main():
         output_path=OUTPUT_PATH
     )
     
-    processed_data = preprocessor.process_train_sessions(sessions=[ 2, 3, 4])
-    
-    print("\n✓ Preprocessing complete!")
+    # 產全部（train set）
+    for session in [2,3,4,5]:
+        preprocessor.process_session_and_save(session)
+
+    print("\n✓ 全部 Session 預處理完成")
+
 
 if __name__ == "__main__":
     main()
+
 
