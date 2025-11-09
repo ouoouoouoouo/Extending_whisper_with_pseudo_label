@@ -1,0 +1,59 @@
+# verify_preprocessing.py
+"""驗證預處理配置是否與論文一致"""
+
+from datasets import load_from_disk
+from transformers import WhisperTokenizer
+
+print("="*70)
+print("驗證預處理配置")
+print("="*70)
+
+# 1. 檢查 Tokenizer
+tokenizer = WhisperTokenizer.from_pretrained("./custom_whisper_tokenizer")
+print(f"\n1. Tokenizer:")
+print(f"   詞彙表大小: {len(tokenizer)}")
+print(f"   包含 SLE tokens: {'<|sle_happy|>' in tokenizer.get_vocab()}")
+print(f"   包含 WLE tokens: {'<|wle_happy|>' in tokenizer.get_vocab()}")
+
+# 2. 檢查 IEMOCAP 資料集
+iem_train = load_from_disk("./iemocap_processed/processed_train")
+iem_val = load_from_disk("./iemocap_processed/processed_val")
+iem_test = load_from_disk("./iemocap_processed/processed_test")
+
+print(f"\n2. IEMOCAP 資料集:")
+print(f"   訓練集: {len(iem_train)} 樣本")
+print(f"   驗證集: {len(iem_val)} 樣本")
+print(f"   測試集: {len(iem_test)} 樣本")
+
+# 檢查是否有 SLE/WLE tokens
+sample = iem_train[0]
+has_sle = any(tokenizer.decode([id]) for id in sample['labels'] if '<|sle_' in tokenizer.decode([id]))
+has_wle = any(tokenizer.decode([id]) for id in sample['labels'] if '<|wle_' in tokenizer.decode([id]))
+print(f"   包含 SLE: {has_sle}")
+print(f"   包含 WLE: {has_wle}")
+
+# 3. 檢查 Common Voice 資料集
+cv_train = load_from_disk("./cv_processed_for_rehearsal/train")
+cv_val = load_from_disk("./cv_processed_for_rehearsal/val")
+cv_test = load_from_disk("./cv_processed_for_rehearsal/test")
+
+print(f"\n3. Common Voice 資料集:")
+print(f"   訓練集: {len(cv_train)} 樣本")
+print(f"   驗證集: {len(cv_val)} 樣本")
+print(f"   測試集: {len(cv_test)} 樣本")
+
+# 檢查是否為 vanilla ASR（不含情緒 tokens）
+cv_sample = cv_train[0]
+has_emotion = any('<|sle_' in tokenizer.decode([id]) or '<|wle_' in tokenizer.decode([id]) 
+                  for id in cv_sample['labels'] if id != -100)
+print(f"   包含情緒 tokens: {has_emotion}（應該是 False）")
+
+# 4. 檢查前綴設置
+print(f"\n4. 前綴設置:")
+print(f"   IEMOCAP 前 5 個 labels: {sample['labels'][:5]}")
+print(f"   CV 前 5 個 labels: {cv_sample['labels'][:5]}")
+print(f"   前綴是否為 -100: {sample['labels'][0] == -100 and sample['labels'][1] == -100}")
+
+print("\n" + "="*70)
+print("✓ 驗證完成")
+print("="*70)
