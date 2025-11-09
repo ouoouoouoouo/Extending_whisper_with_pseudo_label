@@ -12,7 +12,7 @@ from transformers import WhisperTokenizerFast, WhisperConfig
 from transformers import get_linear_schedule_with_warmup
 from whisper_emotion_model import WhisperForEmotionRecognition
 from generate_multitask_targets import WhisperEmotionDataPreprocessor
-from preprocess_common_voice import CommonVoicePreprocessor
+from preprocess_common_voice import CommonVoicePreprocessorForRehearsal
 
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import ReduceLROnPlateau
@@ -31,7 +31,7 @@ torch.multiprocessing.set_sharing_strategy('file_system')
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"將使用 {device} 進行訓練...")
 
-BASE_MODEL_NAME = "openai/whisper-large-v2"
+BASE_MODEL_NAME = "openai/whisper-base"
 TOKENIZER_PATH = "./custom_whisper_tokenizer"
 MODEL_PATH = "./my-whisper-emotion-model-resized"
 
@@ -191,9 +191,10 @@ iemocap_preprocessor.tokenizer = tokenizer
 train_dataset_iemocap = load_from_disk("./iemocap_processed/processed_train")
 val_dataset_iemocap = load_from_disk("./iemocap_processed/processed_val")
 
-cv_preprocessor = CommonVoicePreprocessor(
+cv_preprocessor = CommonVoicePreprocessorForRehearsal(
+    custom_tokenizer_path=TOKENIZER_PATH, 
     base_model=BASE_MODEL_NAME,
-    cv_data_path="/home/ouo/whisper_emotion/workspace/commonvoice/cv-corpus-21.0-delta-2025-03-14/en"
+    cv_data_path="/home/ouo/whisper_emotion/workspace/CV/en"
 )
 cv_preprocessor.tokenizer = tokenizer
 
@@ -426,16 +427,16 @@ def check_gradient_flow(model, step):
 # ============================================================================
 # 訓練參數
 # ============================================================================
-BATCH_SIZE = 2
+BATCH_SIZE = 4
 ACCUMULATION_STEPS = 1
 NUM_WORKERS = 0
-WARMUP_STEPS = 500
+WARMUP_STEPS = 300
 LEARNING_RATE = 1e-5
 EPOCHS = 2
 MODEL_SAVE_PATH = Path("./whisper_emotion_debug")
 MODEL_SAVE_PATH.mkdir(parents=True, exist_ok=True)
 
-BETA = 0.5
+BETA = 1
 VALIDATION_STEPS = 250
 DEBUG_INTERVAL = 50  # 每 50 步詳細 debug
 
