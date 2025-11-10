@@ -33,7 +33,7 @@ print(f"將使用 {device} 進行訓練...")
 
 BASE_MODEL_NAME = "openai/whisper-base"
 TOKENIZER_PATH = "./custom_whisper_tokenizer"
-MODEL_PATH = "./my-whisper-emotion-model-resized"
+MODEL_PATH = "./my-whisper-emotion-model-reinit-v2"
 
 # ============================================================================
 # 載入 Tokenizer
@@ -44,22 +44,22 @@ tokenizer = WhisperTokenizerFast.from_pretrained(TOKENIZER_PATH)
 sle_token_ids_full = {e: id for e, id in tokenizer.get_added_vocab().items() if e.startswith("<|sle_")}
 wle_token_ids_full = {e: id for e, id in tokenizer.get_added_vocab().items() if e.startswith("<|wle_")}
 
-sle_token_ids = {
-    token.replace("<|sle_", "").replace("|>", ""): token_id
-    for token, token_id in sle_token_ids_full.items()
-}
-wle_token_ids = {
-    token.replace("<|wle_", "").replace("|>", ""): token_id
-    for token, token_id in wle_token_ids_full.items()
-}
+sle_token_ids = {k.replace("<|sle_", "").replace("|>", ""): v for k, v in sle_token_ids_full.items()}
+wle_token_ids = {k.replace("<|wle_", "").replace("|>", ""): v for k, v in wle_token_ids_full.items()}
 
 print(f"✓ SLE Token IDs: {sle_token_ids}")
 print(f"✓ WLE Token IDs: {wle_token_ids}")
 
 # 建立反向映射
-id_to_emotion = {v: k for k, v in {**sle_token_ids, **wle_token_ids}.items()}
+id_to_emotion = {}
+for emo, tid in sle_token_ids.items():
+    id_to_emotion[tid] = emo
+for emo, tid in wle_token_ids.items():
+    id_to_emotion[tid] = emo
+
 sle_ids_set = set(sle_token_ids.values())
 wle_ids_set = set(wle_token_ids.values())
+
 
 # ============================================================================
 # 載入模型
@@ -75,35 +75,31 @@ model = WhisperForEmotionRecognition.from_pretrained(
     torch_dtype=torch.bfloat16
 )
 
-# 調整 embedding 大小，使模型支援新的情緒 token
-model.resize_token_embeddings(len(tokenizer))
+# 調整並正確初始化新增 token 的 embedding
+new_num_tokens = len(tokenizer)
+old_num_tokens = model.config.vocab_size  # 先讀出舊的 vocab size
 
-# **很重要：重新初始化新增 tokens 的 embedding**
-with torch.no_grad():
-    new_num_tokens = len(tokenizer)
-    old_num_tokens = model.config.vocab_size
+if new_num_tokens != old_num_tokens:
+    # resize embedding weights to new vocab size
+    model.resize_token_embeddings(new_num_tokens)
+    # 只初始化剛新增的 embedding 範圍 [old_num_tokens : new_num_tokens)
     if new_num_tokens > old_num_tokens:
-        print(f"🔧 初始化新增的 {new_num_tokens - old_num_tokens} 個 token embedding")
-        model.model.decoder.embed_tokens.weight[old_num_tokens:new_num_tokens].normal_(mean=0.0, std=0.02)
-        model.model.encoder.embed_tokens.weight[old_num_tokens:new_num_tokens].normal_(mean=0.0, std=0.02)
+        with torch.no_grad():
+            print(f"🔧 初始化新增的 {new_num_tokens - old_num_tokens} 個 token embedding")
+            model.model.decoder.embed_tokens.weight[old_num_tokens:new_num_tokens].normal_(mean=0.0, std=0.02)
+            # 若 encoder 也使用相同 vocab（視 model 實作而定）
+            try:
+                model.model.encoder.embed_tokens.weight[old_num_tokens:new_num_tokens].normal_(mean=0.0, std=0.02)
+            except Exception:
+                # 有些 implementation 可能沒有 encoder.embed_tokens 可直接寫入
+                pass
 
-model.config.vocab_size = len(tokenizer)
-# 調整 embedding 大小，使模型支援新的情緒 token
-model.resize_token_embeddings(len(tokenizer))
-
-# **很重要：重新初始化新增 tokens 的 embedding**
-with torch.no_grad():
-    new_num_tokens = len(tokenizer)
-    old_num_tokens = model.config.vocab_size
-    if new_num_tokens > old_num_tokens:
-        print(f"🔧 初始化新增的 {new_num_tokens - old_num_tokens} 個 token embedding")
-        model.model.decoder.embed_tokens.weight[old_num_tokens:new_num_tokens].normal_(mean=0.0, std=0.02)
-        model.model.encoder.embed_tokens.weight[old_num_tokens:new_num_tokens].normal_(mean=0.0, std=0.02)
-
-model.config.vocab_size = len(tokenizer)
+# 最後把 config.vocab_size 更新到 new_num_tokens（確保一致）
+model.config.vocab_size = new_num_tokens
 
 model.to(device)
 print("✓ 模型載入完成")
+
 
 # ============================================================================
 # 詳細的模型狀態檢查
@@ -191,15 +187,15 @@ iemocap_preprocessor.tokenizer = tokenizer
 train_dataset_iemocap = load_from_disk("./iemocap_processed/processed_train")
 val_dataset_iemocap = load_from_disk("./iemocap_processed/processed_val")
 
-cv_preprocessor = CommonVoicePreprocessorForRehearsal(
-    custom_tokenizer_path=TOKENIZER_PATH, 
+cv_preprocessor =CommonVoicePreprocessorForRehearsal(
     base_model=BASE_MODEL_NAME,
-    cv_data_path="/home/ouo/whisper_emotion/workspace/CV/en"
+    cv_data_path="/home/ouo/whisper_emotion/workspace/CV/en/clips",
+    custom_tokenizer_path=TOKENIZER_PATH
 )
 cv_preprocessor.tokenizer = tokenizer
 
-train_dataset_cv = load_from_disk("./cv_processed/train")
-val_dataset_cv = load_from_disk("./cv_processed/val")
+train_dataset_cv = load_from_disk("./cv_processed_for_rehearsal/train")
+val_dataset_cv = load_from_disk("./cv_processed_for_rehearsal/val")
 
 print(f"✓ IEMOCAP 訓練集: {len(train_dataset_iemocap)} 樣本")
 print(f"✓ Common Voice 訓練集: {len(train_dataset_cv)} 樣本")
@@ -427,16 +423,16 @@ def check_gradient_flow(model, step):
 # ============================================================================
 # 訓練參數
 # ============================================================================
-BATCH_SIZE = 4
-ACCUMULATION_STEPS = 1
+BATCH_SIZE = 1
+ACCUMULATION_STEPS = 4
 NUM_WORKERS = 0
-WARMUP_STEPS = 300
+WARMUP_STEPS = 500
 LEARNING_RATE = 1e-5
 EPOCHS = 2
 MODEL_SAVE_PATH = Path("./whisper_emotion_debug")
 MODEL_SAVE_PATH.mkdir(parents=True, exist_ok=True)
 
-BETA = 1
+BETA = 0.5
 VALIDATION_STEPS = 250
 DEBUG_INTERVAL = 50  # 每 50 步詳細 debug
 
@@ -478,7 +474,6 @@ optimizer = AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=0.01)
 # 在建立優化器之後調用
 all_emotion_ids = sle_ids_set | wle_ids_set
 is_healthy = check_model_training_state(model, optimizer, all_emotion_ids)
-
 
 if not is_healthy:
     print("發現問題，需要修正後再開始訓練！")
@@ -828,3 +823,4 @@ print("\n" + "="*70)
 print("🎉 訓練完成！")
 print(f"最佳模型已儲存至: {MODEL_SAVE_PATH}")
 print("="*70)
+
