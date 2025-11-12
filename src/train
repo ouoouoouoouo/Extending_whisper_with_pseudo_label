@@ -174,7 +174,7 @@ print(f"  - Epochs: {EPOCHS} (論文設定)")
 print(f"  - Beta: {BETA}")
 print(f"  - 驗證批次: {VAL_BATCH_SIZE}")
 print(f"  - 模型儲存: {MODEL_SAVE_PATH}")
-print(f"  - 精度: FP16")
+print(f"  - 精度: BF16")
 print(f"  - 最佳模型標準: UAR (適合不平衡資料)")
 
 # ============================================================================
