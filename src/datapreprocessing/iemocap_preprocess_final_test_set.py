@@ -1,5 +1,4 @@
 """
-test set:session 1
 IEMOCAP Dataset Preprocessing with emotion2vec
 使用預訓練的 emotion2vec 模型生成 frame-level 情緒標籤
 """
@@ -14,7 +13,8 @@ from pathlib import Path
 from tqdm import tqdm
 from collections import Counter
 import re
-from funasr import AutoModel
+
+
 
 # 設置 audio backend
 try:
@@ -64,33 +64,35 @@ class IEMOCAPPreprocessor:
         # Initialize models
         self._init_models()
     
-    
+    from huggingface_hub import login
+    login("YOUR TOKEN")
         
     def _init_models(self):
         """Initialize emotion2vec and Whisper"""
         print("正在載入 emotion2vec 模型...")
-        
+
         try:
             from funasr import AutoModel
-            
-            # 使用 emotion2vecbase 模型
+
             self.emotion_model = AutoModel(
-                model="iic/emotion2vec_base",
-                hub="ms"  # 明確指定從 ModelScope (ms) 下載
-                )
-            # =================================================
-            
-            print("✓ emotion2vec 模型載入成功")
-            
+                model="iic/emotion2vec_plus_large",  # 改用 plus_large
+                hub="ms"
+            )
+            print("✓ emotion2vec_plus_large 模型載入成功")
+
         except Exception as e:
+            import traceback
             print(f"警告：無法載入 emotion2vec: {e}")
+            traceback.print_exc()
             print("將使用原始標註作為後備方案")
             self.emotion_model = None
-        
+
         # Whisper for forced alignment
         print("載入 Whisper 模型...")
+        import whisper
         self.whisper_model = whisper.load_model("large")
         print("✓ Whisper 模型載入成功")
+
         
     def parse_iemocap_labels(self, session_path):
         """Parse IEMOCAP emotion labels"""
@@ -147,70 +149,88 @@ class IEMOCAPPreprocessor:
     
     def extract_frame_emotions_emotion2vec(self, audio_path):
         """
-        使用 emotion2vec 提取 frame-level 情緒
+        使用 emotion2vec_plus_large 提取 frame-level 情緒
         """
         if self.emotion_model is None:
             return [], []
         
         try:
-            # 使用 emotion2vec 進行 frame-level 預測
-            result = self.emotion_model.generate(
+            # 取得 utterance-level 結果
+            result_utt = self.emotion_model.generate(
+                str(audio_path),
+                output_dir="./temp_outputs",
+                granularity="utterance",
+                extract_embedding=True
+            )
+            
+            # 取得 frame-level embeddings
+            result_frame = self.emotion_model.generate(
                 str(audio_path),
                 output_dir="./temp_outputs",
                 granularity="frame",
-                extract_embedding=False
+                extract_embedding=True
             )
             
-            # emotion2vec 中英文標籤映射
-            chinese_to_english = {
-                '生气': 'angry',
-                '厌恶': 'disgusted',
-                '恐惧': 'fearful',
-                '开心': 'happy',
-                '中立': 'neutral',
-                '其他': 'other',
-                '难过': 'sad',
-                '吃惊': 'surprised',
-                '<unk>': 'unknown'
+            if not result_utt or not result_frame:
+                return [], []
+            
+            scores = np.array(result_utt[0]['scores'])
+            labels = result_utt[0]['labels']
+            utt_feats = result_utt[0]['feats']
+            frame_feats = result_frame[0]['feats']
+            
+            if frame_feats is None or len(frame_feats) == 0:
+                return [], []
+            
+            # 情緒映射
+            label_map = {
+                '生气/angry': 'angry', '开心/happy': 'happy',
+                '难过/sad': 'sad', '中立/neutral': 'neutral',
+                '厌恶/disgusted': 'neutral', '恐惧/fearful': 'neutral',
+                '其他/other': 'neutral', '吃惊/surprised': 'neutral',
+                '<unk>': 'neutral'
             }
             
-            # 解析結果
-            if result and len(result) > 0:
-                first_result = result[0]
-                
-                # emotion2vec 返回的是 list of Chinese labels
-                if isinstance(first_result, list):
-                    frame_labels = first_result
-                elif isinstance(first_result, dict) and 'labels' in first_result:
-                    frame_labels = first_result['labels']
-                else:
-                    print(f"Unexpected result format: {type(first_result)}")
-                    return [], []
-                
-                # 轉換中文標籤為 4 類情緒
-                frame_emotions = []
-                for chinese_label in frame_labels:
-                    # 轉換中文到英文
-                    english_label = chinese_to_english.get(chinese_label, 'unknown')
-                    # 映射到 4 類
-                    mapped_emotion = self.emotion2vec_to_4class.get(english_label, 'neutral')
-                    frame_emotions.append(mapped_emotion)
-                
-                # 計算 frame 時間戳（假設 50Hz）
-                frame_duration = 0.02  # 20ms
-                frame_timestamps = np.arange(len(frame_emotions)) * frame_duration
-                
-                return frame_emotions, frame_timestamps
+            # 找主導情緒
+            dominant_idx = np.argmax(scores)
+            dominant_score = scores[dominant_idx]
+            dominant_emotion = label_map.get(labels[dominant_idx], 'neutral')
             
-            return [], []
+            num_frames = frame_feats.shape[0]
+            
+            # 計算每個 frame 的情緒強度（用 L2 norm 作為代理）
+            frame_norms = np.linalg.norm(frame_feats, axis=1)
+            
+            # 正規化到 0-1
+            if frame_norms.max() > frame_norms.min():
+                frame_intensity = (frame_norms - frame_norms.min()) / (frame_norms.max() - frame_norms.min())
+            else:
+                frame_intensity = np.ones(num_frames) * 0.5
+            
+            # 用 intensity 閾值決定情緒
+            # 高強度 = 主導情緒，低強度 = neutral
+            threshold = np.percentile(frame_intensity, 50)  # 中位數
+            
+            frame_emotions = []
+            for intensity in frame_intensity:
+                if intensity > threshold and dominant_emotion != 'neutral' and dominant_score > 0.5:
+                    frame_emotions.append(dominant_emotion)
+                else:
+                    frame_emotions.append('neutral')
+            
+            # Frame 時間戳 (20ms per frame)
+            frame_duration = 0.02
+            frame_timestamps = (np.arange(num_frames) * frame_duration).tolist()
+            
+            return frame_emotions, frame_timestamps
             
         except Exception as e:
             print(f"Error with emotion2vec: {e}")
             import traceback
             traceback.print_exc()
             return [], []
+                
             
-        
     def perform_alignment(self, audio_path, transcript):
         """Perform forced alignment using Whisper"""
         try:
@@ -293,8 +313,14 @@ class IEMOCAPPreprocessor:
         transcripts = self.parse_iemocap_transcripts(session_path)
         
         processed_data = []
+        VALID_EMOTIONS = {'neu', 'hap', 'exc', 'sad', 'ang'}  # 加入過濾
         
         for utt_id in tqdm(labels.keys(), desc=f"Session {session_num}"):
+            # 過濾情緒類別
+            original_emotion = labels[utt_id]['original_emotion']
+            if original_emotion not in VALID_EMOTIONS:
+                continue
+                
             if utt_id not in transcripts:
                 continue
             
@@ -302,9 +328,28 @@ class IEMOCAPPreprocessor:
             if audio_path is None or not audio_path.exists():
                 continue
             
+            # ======== 🔧 限制音訊長度至 30 秒以內 ========  
+            try:
+                waveform, sr = torchaudio.load(audio_path)
+                max_duration_sec = 30  # 改為 30 秒
+                max_samples = int(sr * max_duration_sec)
+
+                if waveform.shape[1] > max_samples:
+                    waveform = waveform[:, :max_samples]
+                    # 覆蓋寫回臨時檔案，防止 emotion2vec/whisper memory 爆
+                    tmp_path = self.output_path / "trimmed_audio"
+                    tmp_path.mkdir(exist_ok=True)
+                    trimmed_path = tmp_path / f"{utt_id}.wav"
+                    torchaudio.save(trimmed_path, waveform, sr)
+                    audio_path = trimmed_path  # 使用裁切後音訊
+            except Exception as e:
+                print(f"⚠️ 無法載入或裁切 {audio_path}: {e}")
+           
+            # ============================================
+
             transcript = transcripts[utt_id]['text']
             sentence_emotion = labels[utt_id]['sentence_emotion']
-            
+                        
             try:
                 # Step 1: Frame-level emotion prediction with emotion2vec
                 frame_emotions, frame_timestamps = self.extract_frame_emotions_emotion2vec(audio_path)
