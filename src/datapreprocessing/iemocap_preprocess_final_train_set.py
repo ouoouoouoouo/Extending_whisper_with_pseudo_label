@@ -65,9 +65,7 @@ class IEMOCAPPreprocessor:
         # Initialize models
         self._init_models()
     
-    from huggingface_hub import login
-    login("your token")
-        
+    
     def _init_models(self):
         """Initialize emotion2vec and Whisper"""
         print("正在載入 emotion2vec 模型...")
@@ -75,21 +73,18 @@ class IEMOCAPPreprocessor:
         try:
             from funasr import AutoModel
 
-            # === 修正：改回使用 ModelScope 線上 ID，讓它自動下載 ===
-            # 建議使用 'iic/emotion2vec_plus_large' 因為它效果更好且通常包含完整設定
-                        # 如果您堅持用 base 版，也可以寫 'damo/emotion2vec_base'
             self.emotion_model = AutoModel(
-                model="iic/emotion2vec_base",
-                hub="ms"  # 明確指定從 ModelScope (ms) 下載
-                )
-            # =================================================
-            print("✓ emotion2vec 模型載入成功")
-                
+                model="iic/emotion2vec_plus_large",  # 改用 plus_large
+                hub="ms"
+            )
+            print("✓ emotion2vec_plus_large 模型載入成功")
+
         except Exception as e:
+            import traceback
             print(f"警告：無法載入 emotion2vec: {e}")
-            print("將使用原始標註作為後備方案")
+            traceback.print_exc()
             self.emotion_model = None
-        
+
         # Whisper for forced alignment
         print("載入 Whisper 模型...")
         self.whisper_model = whisper.load_model("large")
@@ -150,62 +145,78 @@ class IEMOCAPPreprocessor:
     
     def extract_frame_emotions_emotion2vec(self, audio_path):
         """
-        使用 emotion2vec 提取 frame-level 情緒
+        使用 emotion2vec_plus_large 提取 frame-level 情緒
         """
         if self.emotion_model is None:
             return [], []
         
         try:
-            # 使用 emotion2vec 進行 frame-level 預測
-            result = self.emotion_model.generate(
+            # 取得 utterance-level 結果
+            result_utt = self.emotion_model.generate(
+                str(audio_path),
+                output_dir="./temp_outputs",
+                granularity="utterance",
+                extract_embedding=True
+            )
+            
+            # 取得 frame-level embeddings
+            result_frame = self.emotion_model.generate(
                 str(audio_path),
                 output_dir="./temp_outputs",
                 granularity="frame",
-                extract_embedding=False
+                extract_embedding=True
             )
             
-            # emotion2vec 中英文標籤映射
-            chinese_to_english = {
-                '生气': 'angry',
-                '厌恶': 'disgusted',
-                '恐惧': 'fearful',
-                '开心': 'happy',
-                '中立': 'neutral',
-                '其他': 'other',
-                '难过': 'sad',
-                '吃惊': 'surprised',
-                '<unk>': 'unknown'
+            if not result_utt or not result_frame:
+                return [], []
+            
+            scores = np.array(result_utt[0]['scores'])
+            labels = result_utt[0]['labels']
+            frame_feats = result_frame[0]['feats']
+            
+            if frame_feats is None or len(frame_feats) == 0:
+                return [], []
+            
+            # 情緒映射
+            label_map = {
+                '生气/angry': 'angry', '开心/happy': 'happy',
+                '难过/sad': 'sad', '中立/neutral': 'neutral',
+                '厌恶/disgusted': 'neutral', '恐惧/fearful': 'neutral',
+                '其他/other': 'neutral', '吃惊/surprised': 'neutral',
+                '<unk>': 'neutral'
             }
             
-            # 解析結果
-            if result and len(result) > 0:
-                first_result = result[0]
-                
-                # emotion2vec 返回的是 list of Chinese labels
-                if isinstance(first_result, list):
-                    frame_labels = first_result
-                elif isinstance(first_result, dict) and 'labels' in first_result:
-                    frame_labels = first_result['labels']
-                else:
-                    print(f"Unexpected result format: {type(first_result)}")
-                    return [], []
-                
-                # 轉換中文標籤為 4 類情緒
-                frame_emotions = []
-                for chinese_label in frame_labels:
-                    # 轉換中文到英文
-                    english_label = chinese_to_english.get(chinese_label, 'unknown')
-                    # 映射到 4 類
-                    mapped_emotion = self.emotion2vec_to_4class.get(english_label, 'neutral')
-                    frame_emotions.append(mapped_emotion)
-                
-                # 計算 frame 時間戳（假設 50Hz）
-                frame_duration = 0.02  # 20ms
-                frame_timestamps = np.arange(len(frame_emotions)) * frame_duration
-                
-                return frame_emotions, frame_timestamps
+            # 找主導情緒
+            dominant_idx = np.argmax(scores)
+            dominant_score = scores[dominant_idx]
+            dominant_emotion = label_map.get(labels[dominant_idx], 'neutral')
             
-            return [], []
+            num_frames = frame_feats.shape[0]
+            
+            # 計算每個 frame 的情緒強度（用 L2 norm 作為代理）
+            frame_norms = np.linalg.norm(frame_feats, axis=1)
+            
+            # 正規化到 0-1
+            if frame_norms.max() > frame_norms.min():
+                frame_intensity = (frame_norms - frame_norms.min()) / (frame_norms.max() - frame_norms.min())
+            else:
+                frame_intensity = np.ones(num_frames) * 0.5
+            
+            # 用 intensity 閾值決定情緒
+            threshold = np.percentile(frame_intensity, 50)  # 中位數
+            
+            frame_emotions = []
+            for intensity in frame_intensity:
+                if intensity > threshold and dominant_emotion != 'neutral' and dominant_score > 0.5:
+                    frame_emotions.append(dominant_emotion)
+                else:
+                    frame_emotions.append('neutral')
+            
+            # Frame 時間戳 (20ms per frame)
+            frame_duration = 0.02
+            frame_timestamps = (np.arange(num_frames) * frame_duration).tolist()
+            
+            return frame_emotions, frame_timestamps
             
         except Exception as e:
             print(f"Error with emotion2vec: {e}")
@@ -285,44 +296,68 @@ class IEMOCAPPreprocessor:
         """Process one IEMOCAP session"""
         session_name = f"Session{session_num}"
         session_path = self.iemocap_path / session_name
-        
+
         if not session_path.exists():
             print(f"Warning: {session_name} not found")
             return []
-        
+
         print(f"\nProcessing {session_name}...")
-        
+
         labels = self.parse_iemocap_labels(session_path)
         transcripts = self.parse_iemocap_transcripts(session_path)
-        
+
         processed_data = []
+        VALID_EMOTIONS = {'neu', 'hap', 'exc', 'sad', 'ang'}
         
+        # 只有一個迴圈，同時過濾和處理
         for utt_id in tqdm(labels.keys(), desc=f"Session {session_num}"):
+            original_emotion = labels[utt_id]['original_emotion']
+            
+            # 只保留論文使用的情緒
+            if original_emotion not in VALID_EMOTIONS:
+                continue
+                
             if utt_id not in transcripts:
                 continue
-            
+
             audio_path = self.get_audio_path(session_path, utt_id)
             if audio_path is None or not audio_path.exists():
                 continue
-            
+
+            # ======== 音訊長度至 30 秒 ========
+            try:
+                waveform, sr = torchaudio.load(audio_path)
+                max_duration_sec = 30
+                max_samples = int(sr * max_duration_sec)
+
+                if waveform.shape[1] > max_samples:
+                    waveform = waveform[:, :max_samples]
+                    tmp_path = self.output_path / "trimmed_audio"
+                    tmp_path.mkdir(exist_ok=True)
+                    trimmed_path = tmp_path / f"{utt_id}.wav"
+                    torchaudio.save(trimmed_path, waveform, sr)
+                    audio_path = trimmed_path
+            except Exception as e:
+                print(f"⚠️ 無法載入或裁切 {audio_path}: {e}")
+                continue  # 加上 continue，載入失敗就跳過
+            # ============================================
+
             transcript = transcripts[utt_id]['text']
             sentence_emotion = labels[utt_id]['sentence_emotion']
-            
+
             try:
-                # Step 1: Frame-level emotion prediction with emotion2vec
+                # Step 1: Frame-level emotion prediction
                 frame_emotions, frame_timestamps = self.extract_frame_emotions_emotion2vec(audio_path)
-                
+
                 # Step 2: Forced alignment
                 word_alignments = self.perform_alignment(audio_path, transcript)
-                
+
                 # Step 3: Assign emotions to words
                 if len(frame_emotions) > 0:
-                    # 使用 emotion2vec 的 frame-level 預測
                     word_pseudo_labels = self.assign_emotions_to_words(
                         frame_emotions, frame_timestamps, word_alignments, sentence_emotion
                     )
                 else:
-                    # 後備方案：使用句級情緒
                     word_pseudo_labels = []
                     for word, start, end in word_alignments:
                         word_pseudo_labels.append({
@@ -331,7 +366,7 @@ class IEMOCAPPreprocessor:
                             'start': start,
                             'end': end
                         })
-                
+
                 processed_data.append({
                     'utterance_id': utt_id,
                     'audio_path': str(audio_path),
@@ -340,12 +375,13 @@ class IEMOCAPPreprocessor:
                     'word_level_emotions': word_pseudo_labels,
                     'session': session_num
                 })
-                
+
             except Exception as e:
                 print(f"Error: {utt_id}: {e}")
                 continue
-        
-        return processed_data
+
+        return processed_data  
+
     
     def process_session_and_save(self, session_num):
         session_data = self.process_session(session_num)
