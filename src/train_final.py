@@ -145,8 +145,8 @@ BATCH_SIZE = 2 # 論文使用 batch_size=4
 ACCUMULATION_STEPS = 2 #有效batchsize=4
 NUM_WORKERS = 4
 WARMUP_STEPS = 500  # 論文未提及 warmup
-LEARNING_RATE = 1e-5  # 論文未指定，保持預設
-EPOCHS = 10  # Extended training for better convergence (paper may have used more epochs)
+LEARNING_RATE = 5e-5  # Increased for faster convergence in 2 epochs
+EPOCHS = 2  # 論文訓練 2 epochs
 MODEL_SAVE_PATH = Path("./whisper_emotion_bf16_beta1_warmup")
 MODEL_SAVE_PATH.mkdir(parents=True, exist_ok=True)
 
