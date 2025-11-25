@@ -132,11 +132,13 @@ cv_preprocessor.tokenizer = tokenizer
 
 train_dataset_cv = load_from_disk("./cv_processed_for_rehearsal/train")
 val_dataset_cv = load_from_disk("./cv_processed_for_rehearsal/val")
+test_dataset_cv = load_from_disk("./cv_processed_for_rehearsal/test")
 
 print(f"✓ IEMOCAP 訓練集: {len(train_dataset_iemocap)} 樣本 (Session 2-5)")
 print(f"✓ IEMOCAP 驗證集: {len(val_dataset_iemocap)} 樣本 (Session 1)")
 print(f"✓ Common Voice 訓練集: {len(train_dataset_cv)} 樣本")
 print(f"✓ Common Voice 驗證集: {len(val_dataset_cv)} 樣本")
+print(f"✓ Common Voice 測試集: {len(test_dataset_cv)} 樣本")
 
 # ============================================================================
 # 訓練參數
@@ -144,10 +146,10 @@ print(f"✓ Common Voice 驗證集: {len(val_dataset_cv)} 樣本")
 BATCH_SIZE = 2 # 論文使用 batch_size=4
 ACCUMULATION_STEPS = 2 #有效batchsize=4
 NUM_WORKERS = 4
-WARMUP_STEPS = 500  # 論文未提及 warmup
+WARMUP_STEPS = 0  # 論文未提及 warmup
 LEARNING_RATE = 1e-5  # 論文未指定，保持預設
 EPOCHS = 2  # 論文訓練 2 epochs
-MODEL_SAVE_PATH = Path("./whisper_emotion_bf16_beta1_warmup")
+MODEL_SAVE_PATH = Path("./whisper_emotion_bf16_beta1")
 MODEL_SAVE_PATH.mkdir(parents=True, exist_ok=True)
 
 BETA = 1.0
@@ -194,6 +196,9 @@ val_loader_iemocap = iemocap_preprocessor.create_dataloader(
 )
 val_loader_cv = cv_preprocessor.create_dataloader(
     val_dataset_cv, batch_size=VAL_BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS
+)
+test_loader_cv = cv_preprocessor.create_dataloader(  # ← 改名稱
+    test_dataset_cv, batch_size=VAL_BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS
 )
 
 # ============================================================================
@@ -429,7 +434,7 @@ def evaluate_model(model, val_loader_iemocap, val_loader_cv, tokenizer, device,
     cv_prompt_len = len(cv_prompt_ids)
     
     with torch.no_grad():
-        for batch in tqdm(val_loader_cv, desc="Common Voice 驗證"):
+        for batch in tqdm(test_loader_cv, desc="Common Voice 測試"):
             input_features = batch["input_features"].to(device)
             references = batch["original_texts"]
             batch_size = input_features.shape[0]
@@ -685,7 +690,7 @@ for epoch in range(EPOCHS):
     
     # 完整評估
     eval_results = evaluate_model(
-        model, val_loader_iemocap, val_loader_cv, tokenizer, device,
+        model, val_loader_iemocap, test_loader_cv, tokenizer, device,
         sle_token_ids, wle_token_ids, id_to_emotion, epoch + 1
     )
     
