@@ -90,6 +90,38 @@ class IEMOCAPPreprocessor:
         self.whisper_model = whisper.load_model("large")
         print("✓ Whisper 模型載入成功")
         
+    def parse_wdseg(self, wdseg_path):
+        """
+        Convert HTK wdseg frame alignment → word-level timestamps.
+        Each line looks like:
+            SFrm  EFrm  Score  Word
+            0     2     -117721 <s>
+            3    20     -1052907 YOU'RE(2)
+        Frame = 10ms = 0.01 seconds
+        """
+        words = []
+        if not Path(wdseg_path).exists():
+            return words  # 返回空列表，讓 fallback 處理
+        
+        with open(wdseg_path, "r") as f:
+            for line in f:
+                parts = line.strip().split()
+                # skip header
+                if len(parts) < 4 or parts[0] == "SFrm":
+                    continue
+                sfrm = int(parts[0])
+                efrm = int(parts[1])
+                word = parts[3]
+                # clean e.g., WORD(2) → WORD
+                word = re.sub(r"\(\d+\)$", "", word)
+                # remove <sil>, <s>, </s>
+                if word in ["<s>", "</s>", "<sil>"]:
+                    continue
+                start = sfrm * 0.01
+                end = (efrm + 1) * 0.01     # HTK frames are inclusive
+                words.append((word.lower(), start, end))  # 返回 tuple 格式
+        return words
+    
     def parse_iemocap_labels(self, session_path):
         """Parse IEMOCAP emotion labels"""
         label_file = session_path / "dialog" / "EmoEvaluation"
@@ -225,8 +257,33 @@ class IEMOCAPPreprocessor:
             return [], []
             
         
-    def perform_alignment(self, audio_path, transcript):
-        """Perform forced alignment using Whisper"""
+    def perform_alignment(self, audio_path, transcript, utt_id=None):
+        """
+        Perform forced alignment using IEMOCAP wdseg (優先) or Whisper (fallback)
+        """
+        
+        # 優先使用 IEMOCAP 原始的 .wdseg 檔案
+        if utt_id:
+            import re
+            m = re.match(r"Ses(\d{2})", utt_id)
+
+            if m:
+                session_num = int(m.group(1))          # 01 -> 1
+                session_name = f"Session{session_num}"
+                dialog_name = '_'.join(utt_id.split('_')[:-1])  # Ses01F_script02_1
+
+                wdseg_path = (
+                    self.iemocap_path / session_name / "sentences" /
+                    "ForcedAlignment" / dialog_name / f"{utt_id}.wdseg"
+                )
+
+                word_alignments = self.parse_wdseg(wdseg_path)
+                if word_alignments:
+                    return word_alignments
+            # 如果 m 不存在，什麼都不做，直接往下走 Whisper fallback
+
+        
+        # Fallback: 使用 Whisper forced alignment
         try:
             result = self.whisper_model.transcribe(
                 str(audio_path),
@@ -244,22 +301,29 @@ class IEMOCAPPreprocessor:
                             end = word_info['end']
                             word_alignments.append((word, start, end))
             
-            return word_alignments
-            
+            if word_alignments:
+                # print(f"✓ 使用 Whisper: {utt_id if utt_id else 'unknown'}")
+                return word_alignments
+                
         except Exception as e:
-            # Fallback: 均分時間
-            words = transcript.split()
-            waveform, sr = torchaudio.load(audio_path)
-            duration = waveform.shape[1] / sr
-            word_duration = duration / len(words) if words else 0
-            
-            word_alignments = []
-            for i, word in enumerate(words):
-                start = i * word_duration
-                end = (i + 1) * word_duration
-                word_alignments.append((word, start, end))
-            
-            return word_alignments
+            print(f"⚠️  Whisper alignment 失敗: {e}")
+        
+        # 最後的 fallback: 均分時間
+        print(f"⚠️  使用時間均分: {utt_id if utt_id else 'unknown'}")
+        words = transcript.split()
+        import soundfile as sf
+        wav, sr = sf.read(str(audio_path))
+        duration = (len(wav) / sr) if sr else 0.0
+
+        word_duration = duration / len(words) if words else 0
+        
+        word_alignments = []
+        for i, word in enumerate(words):
+            start = i * word_duration
+            end = (i + 1) * word_duration
+            word_alignments.append((word, start, end))
+        
+        return word_alignments
     
     def assign_emotions_to_words(self, frame_emotions, frame_timestamps, word_alignments, fallback_emotion):
         """
@@ -324,23 +388,29 @@ class IEMOCAPPreprocessor:
             if audio_path is None or not audio_path.exists():
                 continue
 
-            # ======== 音訊長度至 30 秒 ========
+            
+            # ======== 🔧 限制音訊長度至 30 秒以內（不依賴 torchaudio/torchcodec）========
             try:
-                waveform, sr = torchaudio.load(audio_path)
+                import soundfile as sf
+                wav, sr = sf.read(str(audio_path))  # wav: (T,) or (T, C)
+
                 max_duration_sec = 30
                 max_samples = int(sr * max_duration_sec)
 
-                if waveform.shape[1] > max_samples:
-                    waveform = waveform[:, :max_samples]
+                # 只裁切，不做重取樣；IEMOCAP wav 通常可直接處理
+                if len(wav) > max_samples:
+                    wav = wav[:max_samples]
+
                     tmp_path = self.output_path / "trimmed_audio"
                     tmp_path.mkdir(exist_ok=True)
                     trimmed_path = tmp_path / f"{utt_id}.wav"
-                    torchaudio.save(trimmed_path, waveform, sr)
+                    sf.write(str(trimmed_path), wav, sr)
                     audio_path = trimmed_path
+
             except Exception as e:
                 print(f"⚠️ 無法載入或裁切 {audio_path}: {e}")
-                continue  # 加上 continue，載入失敗就跳過
-            # ============================================
+                continue
+            # ========================================================================
 
             transcript = transcripts[utt_id]['text']
             sentence_emotion = labels[utt_id]['sentence_emotion']
@@ -350,7 +420,7 @@ class IEMOCAPPreprocessor:
                 frame_emotions, frame_timestamps = self.extract_frame_emotions_emotion2vec(audio_path)
 
                 # Step 2: Forced alignment
-                word_alignments = self.perform_alignment(audio_path, transcript)
+                word_alignments = self.perform_alignment(audio_path, transcript, utt_id=utt_id)
 
                 # Step 3: Assign emotions to words
                 if len(frame_emotions) > 0:
