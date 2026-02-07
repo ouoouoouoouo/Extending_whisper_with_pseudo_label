@@ -1,11 +1,12 @@
 import json
 import torch
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Union # <-- 新增 Union
 from transformers import WhisperTokenizer, WhisperFeatureExtractor
-from datasets import Dataset, Audio
+from datasets import Dataset, Audio, concatenate_datasets # <-- 新增 concatenate_datasets
 import librosa
-import numpy as np # <-- 確保導入 numpy
+import numpy as np
+from tqdm.auto import tqdm # <-- 確保在頂層導入 tqdm
 
 
 class WhisperEmotionDataPreprocessor:
@@ -73,22 +74,36 @@ class WhisperEmotionDataPreprocessor:
         print(f"✓ SLE Token IDs: {self.sle_token_ids}")
         print(f"✓ WLE Token IDs: {self.wle_token_ids}")
         
-        # --- **新增：定義最大音訊長度** ---
+        # --- 定義最大音訊長度 ---
         self.max_audio_length_seconds = 30
         self.sampling_rate = 16000
         self.max_audio_samples = self.max_audio_length_seconds * self.sampling_rate
         print(f"✓ 音訊將被截斷至 {self.max_audio_length_seconds} 秒 ({self.max_audio_samples} 個取樣點)")
 
     
-    def load_pseudo_label_json(self, json_path: str) -> List[Dict]:
+    def load_pseudo_label_json(self, json_path: Union[str, List[str]]) -> List[Dict]:
         """
-        載入包含 pseudo label 的 JSON 檔案
+        載入包含 pseudo label 的 JSON 檔案。支援單一檔案或檔案列表。
         """
-        with open(json_path, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-        
-        print(f"✓ 載入 {len(data)} 筆資料從 {json_path}")
-        return data
+        # 如果是單一字串，轉換為列表以便統一處理
+        if isinstance(json_path, str):
+            json_paths = [json_path]
+        else:
+            json_paths = json_path
+
+        all_data = []
+        for path in json_paths:
+            print(f"正在載入: {path}")
+            try:
+                with open(path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    all_data.extend(data)
+                print(f"  ✓ 成功載入 {len(data)} 筆資料")
+            except FileNotFoundError:
+                 print(f"  ⚠ 警告: 找不到檔案 {path}，跳過。")
+
+        print(f"✓ 總共載入 {len(all_data)} 筆資料")
+        return all_data
     
     def create_target_sequence(
         self,
@@ -134,18 +149,16 @@ class WhisperEmotionDataPreprocessor:
     
     def process_audio(self, audio_path: str) -> Dict[str, np.ndarray]:
         """
-        處理音訊檔案，轉換為 Whisper 所需的特徵
-        ** (已加入截斷和填充邏輯) **
+        處理音訊檔案，轉換為 Whisper 所需的特徵 (包含截斷和填充)
         """
         # 載入音訊 (Whisper 使用 16kHz 採樣率)
         audio, sr = librosa.load(audio_path, sr=self.sampling_rate)
         
-        # --- **關鍵修正：截斷過長的音訊** ---
+        # 截斷過長的音訊
         if len(audio) > self.max_audio_samples:
             audio = audio[:self.max_audio_samples]
             
         # 使用 feature extractor 轉換為 log-mel spectrogram
-        # return_tensors="pt" 會返回 PyTorch 張量，我們改為 "np" 以便儲存
         input_features = self.feature_extractor(
             audio,
             sampling_rate=self.sampling_rate,
@@ -155,11 +168,9 @@ class WhisperEmotionDataPreprocessor:
         # input_features shape (1, 80, 3000) -> (80, 3000)
         input_features = input_features.squeeze(0) 
 
-        # --- **關鍵修正：填充過短的音訊** ---
-        # Whisper 期望特徵長度為 3000
+        # 填充過短的音訊
         feature_length = input_features.shape[1]
         if feature_length < 3000:
-            # 創建一個全 0 (log-mel 中的 0) 的 numpy array 用於填充
             padding = np.zeros((input_features.shape[0], 3000 - feature_length), dtype=input_features.dtype)
             input_features = np.concatenate([input_features, padding], axis=1)
 
@@ -170,13 +181,6 @@ class WhisperEmotionDataPreprocessor:
     def preprocess_single_example(self, example: Dict) -> Dict:
         """
         預處理單一樣本
-        
-        論文中的序列格式（Format C）：
-        <|startoftranscript|> <|en|> <|transcribe|> <|sle_emotion|> word1 <|wle_e1|> word2 ... <|endoftext|>
-        
-        訓練時：
-        - decoder_input_ids: 完整序列去掉最後的 EOS（用於 teacher forcing）
-        - labels: 完整序列去掉第一個 token（用於計算 loss，已 shift）
         """
         # 1. 處理音訊
         audio_features = self.process_audio(example['audio_path'])
@@ -188,27 +192,20 @@ class WhisperEmotionDataPreprocessor:
             word_level_emotions=example['word_level_emotions']
         )
         
-        # target_ids 格式：
-        # [<BOS>, <lang>, <task>, <sle>, word1, <wle1>, ..., <EOS>]
-        
         # 3. 建立 decoder_input_ids（去掉最後的 EOS）
         decoder_input_ids = target_ids[:-1]
-        # [<BOS>, <lang>, <task>, <sle>, word1, <wle1>, ...]
         
         # 4. 建立 labels（去掉第一個 BOS，保留 EOS）
         labels = target_ids[1:]
-        # [<lang>, <task>, <sle>, word1, <wle1>, ..., <EOS>]
         
-        # 5. (可選) 將前綴 tokens 設為 -100，不計算 loss
-        # 這樣模型只學習預測情緒和文字，不學習預測語言/任務 token
+        # 5. 將前綴 tokens 設為 -100，不計算 loss
         labels_with_prefix_ignored = labels.copy()
         labels_with_prefix_ignored[0] = -100  # <lang>
         labels_with_prefix_ignored[1] = -100  # <task>
-        # 不要 mask <sle>，因為這是我們要學習的！
         
         return {
             'input_features': audio_features['input_features'],
-            'labels': labels_with_prefix_ignored,  # ← 已經 shift，且 mask 了前綴
+            'labels': labels_with_prefix_ignored,
             'decoder_input_ids': decoder_input_ids,
             'target_text': target_text,
             'original_text': example['transcript'],
@@ -218,30 +215,35 @@ class WhisperEmotionDataPreprocessor:
     
     def preprocess_dataset(
         self,
-        json_path: str,
+        json_path: Union[str, List[str]], # <-- 修改型別提示
         output_path: str = None
     ) -> Dataset:
         """
-        預處理整個資料集
+        預處理整個資料集。支援單一 JSON 檔案或檔案列表。
         """
-        # 1. 載入 JSON 資料
+        # 1. 載入 JSON 資料 (已修改為支援多檔案)
         raw_data = self.load_pseudo_label_json(json_path)
         
         # 2. 預處理每個樣本
         processed_data = []
+        # 使用 tqdm.auto.tqdm 以獲得更好的兼容性
         for i, example in enumerate(tqdm(raw_data, desc="正在預處理資料")):
             try:
                 processed = self.preprocess_single_example(example)
                 processed_data.append(processed)
             except Exception as e:
-                print(f"⚠ 處理第 {i} 筆資料 ({example.get('audio_path', 'N/A')}) 時發生錯誤: {e}")
+                # print(f"⚠ 處理第 {i} 筆資料 ({example.get('audio_path', 'N/A')}) 時發生錯誤: {e}")
+                # 錯誤太多時會洗版，可以考慮只印出前幾個錯誤或計數
                 continue
         
         # 3. 轉換為 Hugging Face Dataset
         dataset = Dataset.from_list(processed_data)
         
         print(f"\n✓ 成功處理 {len(dataset)} 筆資料 (已過濾 {len(raw_data) - len(dataset)} 筆)")
-        print(f"Dataset 欄位: {dataset.column_names}")
+        try:
+             print(f"Dataset 欄位: {dataset.column_names}")
+        except:
+            pass # 有時候空 dataset 會報錯
         
         # 4. 儲存處理後的資料集 (可選)
         if output_path:
@@ -264,16 +266,13 @@ class WhisperEmotionDataPreprocessor:
         
         def collate_fn(batch):
             """自定義的 collate function 用於處理不同長度的序列"""
-            # 取得 batch 中最長的序列長度
             max_label_length = max(len(item['labels']) for item in batch)
             max_decoder_length = max(len(item['decoder_input_ids']) for item in batch)
             
-            # input_features 現在都是 30 秒 (80, 3000)，可以直接堆疊
             input_features = torch.stack([
                 torch.tensor(item['input_features']) for item in batch
             ])
             
-            # Padding labels 和 decoder_input_ids
             labels = []
             decoder_input_ids = []
             
@@ -307,7 +306,7 @@ class WhisperEmotionDataPreprocessor:
                 'target_texts': [item['target_text'] for item in batch],
                 'original_texts': [item['original_text'] for item in batch],
                 'sentence_emotions': [item['sentence_emotion'] for item in batch],
-                'audio_paths': [item['audio_path'] for item in batch] # 新增 (用於 debug)
+                'audio_paths': [item['audio_path'] for item in batch]
             }
         
         return DataLoader(
@@ -336,12 +335,12 @@ class WhisperEmotionDataPreprocessor:
         print(f"\nDecoder Input IDs: {example['decoder_input_ids'][:20]}...")
         print(f"Decoder Input 長度: {len(example['decoder_input_ids'])}")
         
-        # input_features 是 list of lists, 手動計算 shape
         try:
             features_shape = (len(example['input_features']), len(example['input_features'][0]) if example['input_features'] else 0)
         except Exception:
-            features_shape = (len(example['input_features']),)
-        
+             # 如果已经是 numpy array
+            features_shape = np.array(example['input_features']).shape
+
         print(f"\nInput Features shape: {features_shape}")
         print("="*80 + "\n")
 
@@ -360,62 +359,142 @@ def main():
         save_tokenizer_path="./custom_whisper_tokenizer"
     )
     
-    # 2. 預處理資料集
-    print("\n步驟 2: 預處理資料集")
-    train_dataset = preprocessor.preprocess_dataset(
-        json_path="/home/ouo/whisper_emotion/workspace/iemocap_processed/iemocap_with_pseudo_labels_train_set.json",
-        output_path="./iemocap_processed/processed_train"
-    )
+    # 2. 載入訓練集 (Sessions 2-5)
+    print("\n步驟 2: 載入訓練集 (Sessions 2-5)")
+    train_json_paths = [
+        "/home/ouo/whisper_emotion/workspace/iemocap_processed/Session2.json",
+        "/home/ouo/whisper_emotion/workspace/iemocap_processed/Session3.json",
+        "/home/ouo/whisper_emotion/workspace/iemocap_processed/Session4.json",
+        "/home/ouo/whisper_emotion/workspace/iemocap_processed/Session5.json"
+    ]
     
-    val_dataset = preprocessor.preprocess_dataset(
-        json_path="/home/ouo/whisper_emotion/workspace/iemocap_processed/iemocap_with_pseudo_labels_validation_set.json",
-        output_path="./iemocap_processed/processed_val"
-    )
-    test_dataset=preprocessor.preprocess_dataset(
-        json_path="/home/ouo/whisper_emotion/workspace/iemocap_processed/iemocap_with_pseudo_labels_test_set.json",
+    print("\n--- 載入並合併 Sessions 2-5 作為訓練集 ---")
+    all_train_data = preprocessor.load_pseudo_label_json(train_json_paths)
+    
+    if len(all_train_data) == 0:
+        print("❌ 錯誤: 訓練集為空!")
+        return None, None, None
+    
+    print(f"✓ 訓練集總共載入 {len(all_train_data)} 筆資料")
+    
+    # 3. 分析訓練集情緒分布
+    print("\n步驟 3: 分析訓練集情緒分布")
+    from collections import Counter
+    emotion_dist = Counter(sample['sentence_emotion'] for sample in all_train_data)
+    
+    print("訓練集情緒分布:")
+    for emotion in ['neutral', 'happy', 'sad', 'angry']:
+        count = emotion_dist[emotion]
+        pct = count / len(all_train_data) * 100
+        print(f"  {emotion:8s}: {count:4d} ({pct:5.1f}%)")
+    
+    # 4. 預處理訓練集
+    print("\n步驟 4: 預處理訓練集")
+    processed_train = []
+    for example in tqdm(all_train_data, desc="處理訓練集"):
+        try:
+            processed = preprocessor.preprocess_single_example(example)
+            processed_train.append(processed)
+        except Exception as e:
+            continue
+    
+    # 轉換為 Dataset
+    from datasets import Dataset
+    train_dataset = Dataset.from_list(processed_train)
+    print(f"✓ 成功處理訓練集 {len(train_dataset)} 筆資料")
+    
+    # 儲存訓練集
+    train_output_path = "./iemocap_processed/processed_train"
+    train_dataset.save_to_disk(train_output_path)
+    print(f"✓ 訓練集已儲存至: {train_output_path}")
+    
+    # 5. 載入並處理測試集 (Session 1)
+    print("\n步驟 5: 載入並處理測試集 (Session 1)")
+    test_json_path = "/home/ouo/whisper_emotion/workspace/iemocap_processed/iemocap_with_pseudo_labels_test_set.json"
+    
+    test_dataset = preprocessor.preprocess_dataset(
+        json_path=test_json_path,
         output_path="./iemocap_processed/processed_test"
     )
     
-    # 3. 視覺化一個樣本
-    print("\n步驟 3: 視覺化樣本")
-    preprocessor.visualize_example(train_dataset[0])
+    if len(test_dataset) == 0:
+        print("❌ 警告: 測試集為空!")
+        train_loader = preprocessor.create_dataloader(
+            train_dataset,
+            batch_size=4,
+            shuffle=True
+        )
+        return preprocessor, train_loader, None
     
-    # 4. 建立 DataLoader
-    print("\n步驟 4: 建立 DataLoader")
+    # 分析測試集情緒分布
+    test_data = preprocessor.load_pseudo_label_json(test_json_path)
+    test_emotion_dist = Counter(sample['sentence_emotion'] for sample in test_data)
+    
+    print("\n測試集情緒分布:")
+    for emotion in ['neutral', 'happy', 'sad', 'angry']:
+        count = test_emotion_dist[emotion]
+        pct = count / len(test_data) * 100 if len(test_data) > 0 else 0
+        print(f"  {emotion:8s}: {count:4d} ({pct:5.1f}%)")
+    
+    # 6. 視覺化訓練集樣本
+    print("\n步驟 6: 視覺化訓練集樣本")
+    if len(train_dataset) > 0:
+        preprocessor.visualize_example(train_dataset[0])
+    
+    # 7. 建立 DataLoader
+    print("\n步驟 7: 建立 DataLoader")
     train_loader = preprocessor.create_dataloader(
         train_dataset,
         batch_size=4,
         shuffle=True
     )
     
-    val_loader = preprocessor.create_dataloader(
-        val_dataset,
+    test_loader = preprocessor.create_dataloader(
+        test_dataset,
         batch_size=4,
         shuffle=False
     )
-    test_loader=preprocessor.create_dataloader(
-        test_dataset, # <-- 修正：使用 test_dataset
-        batch_size=4,
-        shuffle=False # <-- 修正：測試時不應打亂
-    )
-    # 5. 測試載入一個 batch
-    print("\n步驟 5: 測試載入 batch")
+    
+    # 8. 測試載入 batch
+    print("\n步驟 8: 測試載入 batch")
+    print("\n--- 訓練集 batch ---")
     for batch in train_loader:
-        print(f"Batch input_features shape: {batch['input_features'].shape}")
-        print(f"Batch labels shape: {batch['labels'].shape}")
-        print(f"Batch decoder_input_ids shape: {batch['decoder_input_ids'].shape}")
+        print(f"Input features shape: {batch['input_features'].shape}")
+        print(f"Labels shape: {batch['labels'].shape}")
         print(f"Batch size: {len(batch['target_texts'])}")
-        print(f"第一個樣本的目標文字: {batch['target_texts'][0]}")
+        print(f"樣本情緒: {batch['sentence_emotions']}")
         break
     
-    print("\n✓ 資料預處理完成！")
+    print("\n--- 測試集 batch ---")
+    for batch in test_loader:
+        print(f"Input features shape: {batch['input_features'].shape}")
+        print(f"Labels shape: {batch['labels'].shape}")
+        print(f"Batch size: {len(batch['target_texts'])}")
+        print(f"樣本情緒: {batch['sentence_emotions']}")
+        break
     
-    return preprocessor, train_loader, val_loader, test_loader
-
-
+    # 9. 輸出最終統計
+    print("\n" + "="*70)
+    print("✓ 資料預處理完成！")
+    print("="*70)
+    print(f"訓練集 (Sessions 2-5): {len(train_dataset)} 樣本")
+    print(f"  路徑: {train_output_path}")
+    print(f"\n測試集 (Session 1): {len(test_dataset)} 樣本")
+    print(f"  路徑: ./iemocap_processed/processed_test")
+    print("="*70)
+    
+    print("\n資料集劃分:")
+    print(f"  訓練集: Sessions 2, 3, 4, 5 → {len(train_dataset)} 樣本")
+    print(f"  測試集: Session 1 → {len(test_dataset)} 樣本")
+    print(f"  總計: {len(train_dataset) + len(test_dataset)} 樣本")
+    
+    return preprocessor, train_loader, test_loader
 
 
 if __name__ == "__main__":
-    from tqdm.auto import tqdm # 將 tqdm 導入到主範圍
-    preprocessor, train_loader, val_loader, test_loader = main()
-
+    result = main()
+    if result and result[0] is not None:
+        preprocessor, train_loader, test_loader = result
+        print("\n✓ 成功! preprocessor, train_loader, test_loader 已準備好")
+    else:
+        print("\n❌ 預處理失敗!")
