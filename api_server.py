@@ -108,70 +108,81 @@ def health_check():
     }
 
 @app.post("/predict")
-async def predict_emotion(audio_file: UploadFile = File(...),language: str = "zh"):
+async def predict_emotion(audio_file: UploadFile = File(...), language: str = "zh"):
     """
     上傳音檔進行情感辨識
     
-    支援格式：WAV, MP3, FLAC, M4A, OGG
+    支援格式：WAV, MP3, FLAC, M4A, OGG, AAC 等所有 ffmpeg 支援的格式
     回傳：轉錄文字 + 逐字情感標註
     """
     if model is None:
         raise HTTPException(status_code=503, detail="Model not loaded")
     
     try:
-        # ========== 音訊處理 ==========
+        # ========== 統一音訊處理：全部用 ffmpeg 轉成 16kHz mono WAV ==========
         audio_bytes = await audio_file.read()
         
+        print(f"Processing audio file: {audio_file.filename}")
+        
+        # 獲取原始檔案副檔名
+        file_ext = audio_file.filename.split('.')[-1].lower() if '.' in audio_file.filename else 'raw'
+        
+        # 創建臨時檔案
+        with tempfile.NamedTemporaryFile(suffix=f'.{file_ext}', delete=False) as tmp_in:
+            tmp_in.write(audio_bytes)
+            tmp_in_path = tmp_in.name
+        
+        with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp_out:
+            tmp_out_path = tmp_out.name
+        
         try:
-            if audio_file.filename.lower().endswith('.m4a'):
-                print(f"Detected M4A format, converting to WAV...")
-                
-                with tempfile.NamedTemporaryFile(suffix='.m4a', delete=False) as tmp_in:
-                    tmp_in.write(audio_bytes)
-                    tmp_in_path = tmp_in.name
-                
-                with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp_out:
-                    tmp_out_path = tmp_out.name
-                
-                try:
-                    subprocess.run([
-                        'ffmpeg', '-i', tmp_in_path,
-                        '-ar', '16000', '-ac', '1', '-y', tmp_out_path
-                    ], check=True, capture_output=True)
-                    
-                    waveform, sr = sf.read(tmp_out_path, dtype='float32')
-                    waveform = torch.from_numpy(waveform).unsqueeze(0)
-                    
-                except subprocess.CalledProcessError as e:
-                    raise HTTPException(
-                        status_code=400,
-                        detail=f"M4A 轉檔失敗: {e.stderr.decode() if e.stderr else str(e)}"
-                    )
-                finally:
-                    if os.path.exists(tmp_in_path):
-                        os.unlink(tmp_in_path)
-                    if os.path.exists(tmp_out_path):
-                        os.unlink(tmp_out_path)
-            else:
-                waveform, sr = sf.read(io.BytesIO(audio_bytes), dtype='float32')
-                waveform = torch.from_numpy(waveform)
-                if waveform.ndim == 1:
-                    waveform = waveform.unsqueeze(0)
-                else:
-                    waveform = waveform.T
-                    
+            # 用 ffmpeg 轉成 16kHz mono WAV
+            print(f"Converting {file_ext} to 16kHz mono WAV...")
+            result = subprocess.run([
+                'ffmpeg',
+                '-loglevel', 'error',  # 只顯示錯誤
+                '-i', tmp_in_path,
+                '-ar', '16000',
+                '-ac', '1',
+                '-sample_fmt', 's16',
+                '-y',
+                tmp_out_path
+            ], check=True, capture_output=True)
+            
+            print("✓ Conversion successful")
+            
+            # 讀取轉換後的 WAV
+            waveform, sr = sf.read(tmp_out_path, dtype='float32')
+            waveform = torch.from_numpy(waveform)
+            
+            # 確保是 2D tensor [1, samples]
+            if waveform.ndim == 1:
+                waveform = waveform.unsqueeze(0)
+            
+            # 驗證採樣率
+            if sr != 16000:
+                print(f"Warning: Expected 16kHz but got {sr}Hz, resampling...")
+                waveform = torchaudio.functional.resample(waveform, sr, 16000)
+            
+        except subprocess.CalledProcessError as e:
+            error_msg = e.stderr.decode() if e.stderr else str(e)
+            raise HTTPException(
+                status_code=400,
+                detail=f"音檔轉換失敗 ({file_ext}): {error_msg}"
+            )
         except Exception as e:
             raise HTTPException(
                 status_code=400,
                 detail=f"無法讀取音檔 '{audio_file.filename}': {str(e)}"
             )
+        finally:
+            # 清理臨時檔案
+            if os.path.exists(tmp_in_path):
+                os.unlink(tmp_in_path)
+            if os.path.exists(tmp_out_path):
+                os.unlink(tmp_out_path)
         
-        if waveform.shape[0] > 1:
-            waveform = waveform.mean(dim=0, keepdim=True)
-        
-        if sr != 16000:
-            waveform = torchaudio.functional.resample(waveform, sr, 16000)
-        
+        # 準備輸入特徵
         audio_array = waveform.squeeze().numpy()
         input_features = processor(
             audio_array,
@@ -181,12 +192,11 @@ async def predict_emotion(audio_file: UploadFile = File(...),language: str = "zh
         
         if torch.cuda.is_available():
             input_features = input_features.cuda()
-
-        # ========== 語言處理 ==========
+        
+        # ========== 語言處理（不變）==========
         sot_id = tokenizer.bos_token_id
         transcribe_id = tokenizer.convert_tokens_to_ids("<|transcribe|>")
 
-        # 驗證語言代碼
         print(f"✓ Using language: {language}")
         lang_token = f"<|{language}|>"
         lang_id = tokenizer.convert_tokens_to_ids(lang_token)
@@ -197,15 +207,13 @@ async def predict_emotion(audio_file: UploadFile = File(...),language: str = "zh
                 detail=f"不支援的語言代碼: {language}。常用語言：zh(中文), en(英文), fr(法文), ja(日文)"
             )
         
-        # ========== 第一階段：預測 SLE ==========
+        # ========== 第一階段：預測 SLE（不變）==========
         decoder_input_for_sle = torch.tensor(
-            [[sot_id, lang_id, transcribe_id]],  # 動態語言
+            [[sot_id, lang_id, transcribe_id]],
             dtype=torch.long,
             device=input_features.device
         )
         
-        
-        # 建立 SLE mask
         sle_id_list = list(SLE_TOKENS.keys())
         vocab_size = len(tokenizer)
         sle_mask = torch.full((vocab_size,), float('-inf'), device=input_features.device)
@@ -213,7 +221,6 @@ async def predict_emotion(audio_file: UploadFile = File(...),language: str = "zh
             if 0 <= token_id < vocab_size:
                 sle_mask[token_id] = 0.0
         
-        # Forward pass 預測 SLE
         with torch.no_grad():
             outputs = model(
                 input_features=input_features,
@@ -229,7 +236,7 @@ async def predict_emotion(audio_file: UploadFile = File(...),language: str = "zh
         sentence_emotion = SLE_TOKENS.get(pred_sle_id, 'unknown')
         print(f"✓ Predicted SLE: {sentence_emotion} (ID: {pred_sle_id}, Confidence: {confidence:.2%})")
         
-        # ========== 第二階段：生成轉錄 + 防止重複 ==========
+        # ========== 第二階段：生成轉錄（不變）==========
         decoder_input_for_asr = torch.tensor(
             [[sot_id, lang_id, transcribe_id, pred_sle_id]],
             dtype=torch.long,
@@ -241,21 +248,19 @@ async def predict_emotion(audio_file: UploadFile = File(...),language: str = "zh
                 input_features=input_features,
                 decoder_input_ids=decoder_input_for_asr,
                 max_length=448,
-                min_length=5,  # 最少生成 5 個 tokens
+                min_length=5,
                 num_beams=1,
                 do_sample=False,
                 use_cache=True,
-                repetition_penalty=1.2,  # 防止重複
-                no_repeat_ngram_size=3   # 防止 3-gram 重複
+                repetition_penalty=1.2,
+                no_repeat_ngram_size=3
             )
         
         print(f"✓ Generated {len(predicted_ids[0])} tokens")
         print(f"Token IDs (前 50): {predicted_ids[0].tolist()[:50]}")
         
-        # 移除 prompt（前 4 個 tokens）
         generated_ids_no_prompt = predicted_ids[:, 4:]
         
-        # 解碼
         transcription_with_tokens = tokenizer.decode(
             generated_ids_no_prompt[0],
             skip_special_tokens=False
@@ -266,10 +271,8 @@ async def predict_emotion(audio_file: UploadFile = File(...),language: str = "zh
             skip_special_tokens=True
         )
         
-        # 提取 word-level emotions
         word_emotions = extract_word_emotions(generated_ids_no_prompt[0].tolist())
         
-        # 統計情感分布
         emotion_stats = calculate_emotion_stats(word_emotions)
         emotion_stats["sentence_emotion"] = sentence_emotion
         emotion_stats["sentence_confidence"] = confidence
@@ -277,7 +280,7 @@ async def predict_emotion(audio_file: UploadFile = File(...),language: str = "zh
         return {
             "success": True,
             "filename": audio_file.filename,
-            "language": language,  # 返回實際使用的語言
+            "language": language,
             "sentence_emotion": sentence_emotion,
             "sentence_confidence": confidence,
             "text": text_only,
@@ -292,6 +295,7 @@ async def predict_emotion(audio_file: UploadFile = File(...),language: str = "zh
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"處理錯誤: {str(e)}")
+        
 
 
 def extract_word_emotions(token_ids: List[int]) -> List[Dict]:
